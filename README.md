@@ -18,8 +18,8 @@ A Node.js-based automation bot for interacting with the Union Testnet, supportin
 ## Installation
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/sinak1023/union-testnet-bot.git
-   cd union-testnet-bot
+   git clone https://github.com/sinak1023/union-testne-bot.git
+   cd union-testne-bot
    ```
 
 2. **Install Dependencies**:
