@@ -29,7 +29,7 @@ const logger = {
     console.log(`${colors.cyan}${colors.bold}`);
     console.log(`---------------------------------------------`);
     console.log(`  Union Testnet Auto Bot - Kachal God Mod    `);
-    console.log(`---------------------------------------------`);
+    console.log(`---------------------------------------------${colors.reset}`);
     console.log();
   }
 };
@@ -199,7 +199,7 @@ function saveWallets(wallets) {
   }
 }
 
-async function pollPacketHash(txHash, retries = 50, intervalMs = 5000, telegramBot = null, chatId = null) {
+async function pollPacketHash(txHash, retries = 50, intervalMs = 5000) {
   const headers = {
     accept: 'application/graphql-response+json, application/json',
     'accept-encoding': 'gzip, deflate, br, zstd',
@@ -227,56 +227,49 @@ async function pollPacketHash(txHash, retries = 50, intervalMs = 5000, telegramB
       const res = await axios.post(graphqlEndpoint, data, { headers, ...getAxiosConfig() });
       const result = res.data?.data?.v2_transfers;
       if (result && result.length > 0 && result[0].packet_hash) {
-        return result[0].packet_hash;
+        return { success: true, packetHash: result[0].packet_hash };
       }
     } catch (e) {
-      const msg = `Packet error: ${e.message}`;
-      logger.error(msg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      return { success: false, message: `Packet error: ${e.message}` };
     }
     await delay(intervalMs);
   }
-  const msg = `No packet hash found after ${retries} retries.`;
-  logger.warn(msg);
-  if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-  return null;
+  return { success: false, message: `No packet hash found after ${retries} retries.` };
 }
 
-async function checkBalanceAndApprove(wallet, usdcAddress, spenderAddress, amountUSDC, numTransactions, telegramBot = null, chatId = null) {
+async function checkBalanceAndApprove(wallet, usdcAddress, spenderAddress, amountUSDC, numTransactions) {
+  const logs = [];
   const usdcContract = new ethers.Contract(usdcAddress, USDC_ABI, wallet);
   const balance = await usdcContract.balanceOf(wallet.address);
   const requiredBalance = ethers.parseUnits(amountUSDC.toString(), 6) * BigInt(numTransactions);
   if (balance < requiredBalance) {
     const msg = `${wallet.address} does not have enough USDC. Required: ${ethers.formatUnits(requiredBalance, 6)} USDC, Available: ${ethers.formatUnits(balance, 6)} USDC`;
-    logger.error(msg);
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-    return false;
+    logs.push({ type: 'error', message: msg });
+    return { success: false, logs };
   }
 
   const allowance = await usdcContract.allowance(wallet.address, spenderAddress);
   if (allowance < requiredBalance) {
     const msg = `USDC allowance insufficient. Sending approve transaction...`;
-    logger.loading(msg);
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+    logs.push({ type: 'loading', message: msg });
     const approveAmount = ethers.MaxUint256;
     try {
       const tx = await usdcContract.approve(spenderAddress, approveAmount);
       const receipt = await tx.wait();
       const successMsg = `Approve confirmed: ${explorer.tx(receipt.hash)}`;
-      logger.success(successMsg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
+      logs.push({ type: 'success', message: successMsg });
       await delay(3000);
     } catch (err) {
       const errMsg = `Approve failed: ${err.message}`;
-      logger.error(errMsg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
-      return false;
+      logs.push({ type: 'error', message: errMsg });
+      return { success: false, logs };
     }
   }
-  return true;
+  return { success: true, logs };
 }
 
-async function sendFromWallet(walletInfo, maxTransaction, destination, minPercent, maxPercent, delaySeconds, telegramBot = null, chatId = null) {
+async function sendFromWallet(walletInfo, maxTransaction, destination, minPercent, maxPercent, delaySeconds) {
+  const logs = [];
   const wallet = new ethers.Wallet(walletInfo.privatekey, provider());
   let recipientAddress, destinationName, channelId, operand;
 
@@ -286,9 +279,8 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, minPercen
     channelId = 7;
     if (!recipientAddress) {
       const msg = `Skipping wallet '${walletInfo.name || 'Unnamed'}': Missing babylonAddress.`;
-      logger.warn(msg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-      return;
+      logs.push({ type: 'warn', message: msg });
+      return { logs };
     }
   } else if (destination === 'holesky') {
     recipientAddress = wallet.address;
@@ -296,9 +288,8 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, minPercen
     channelId = 8;
   } else {
     const msg = `Invalid destination: ${destination}`;
-    logger.error(msg);
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-    return;
+    logs.push({ type: 'error', message: msg });
+    return { logs };
   }
 
   const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, wallet);
@@ -306,9 +297,8 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, minPercen
   const balanceUSDC = parseFloat(ethers.formatUnits(balance, 6));
   if (balanceUSDC <= 0) {
     const msg = `Wallet ${wallet.address} (${walletInfo.name || 'Unnamed'}) has no USDC balance.`;
-    logger.error(msg);
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-    return;
+    logs.push({ type: 'error', message: msg });
+    return { logs };
   }
 
   const minAmount = balanceUSDC * (minPercent / 100);
@@ -317,11 +307,11 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, minPercen
   const formattedAmount = parseFloat(amountUSDC.toFixed(6));
 
   const msg = `Sending ${maxTransaction} Transaction(s) of ${formattedAmount} USDC Sepolia to ${destinationName} from ${wallet.address} (${walletInfo.name || 'Unnamed'})`;
-  logger.loading(msg);
-  if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+  logs.push({ type: 'loading', message: msg });
 
-  const shouldProceed = await checkBalanceAndApprove(wallet, USDC_ADDRESS, contractAddress, formattedAmount, maxTransaction, telegramBot, chatId);
-  if (!shouldProceed) return;
+  const approvalResult = await checkBalanceAndApprove(wallet, USDC_ADDRESS, contractAddress, formattedAmount, maxTransaction);
+  logs.push(...approvalResult.logs);
+  if (!approvalResult.success) return { logs };
 
   const contract = new ethers.Contract(contractAddress, UCS03_ABI, wallet);
   const senderHex = wallet.address.slice(2).toLowerCase();
@@ -338,8 +328,7 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, minPercen
 
   for (let i = 1; i <= maxTransaction; i++) {
     const stepMsg = `${walletInfo.name || 'Unnamed'} | Transaction ${i}/${maxTransaction} (${formattedAmount} USDC)`;
-    logger.step(stepMsg);
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, stepMsg);
+    logs.push({ type: 'step', message: stepMsg });
     const now = BigInt(Date.now()) * 1_000_000n;
     const oneDayNs = 86_400_000_000_000n;
     const timeoutTimestamp = (now + oneDayNs).toString();
@@ -355,33 +344,33 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, minPercen
       const tx = await contract.send(channelId, timeoutHeight, timeoutTimestamp, salt, instruction);
       await tx.wait(1);
       const successMsg = `${timelog()} | ${walletInfo.name || 'Unnamed'} | Transaction Confirmed: ${explorer.tx(tx.hash)}`;
-      logger.success(successMsg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
+      logs.push({ type: 'success', message: successMsg });
       const txHash = tx.hash.startsWith('0x') ? tx.hash : `0x${tx.hash}`;
-      const packetHash = await pollPacketHash(txHash, 50, 5000, telegramBot, chatId);
-      if (packetHash) {
-        const packetMsg = `${timelog()} | ${walletInfo.name || 'Unnamed'} | Packet Submitted: ${union.tx(packetHash)}`;
-        logger.success(packetMsg);
-        if (telegramBot && chatId) telegramBot.sendMessage(chatId, packetMsg);
+      const packetResult = await pollPacketHash(txHash);
+      if (packetResult.success) {
+        const packetMsg = `${timelog()} | ${walletInfo.name || 'Unnamed'} | Packet Submitted: ${union.tx(packetResult.packetHash)}`;
+        logs.push({ type: 'success', message: packetMsg });
+      } else {
+        logs.push({ type: packetResult.message.includes('No packet hash') ? 'warn' : 'error', message: packetResult.message });
       }
-      console.log('');
+      logs.push({ type: 'info', message: '' });
     } catch (err) {
       const errMsg = `Failed for ${wallet.address}: ${err.message}`;
-      logger.error(errMsg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
-      console.log('');
+      logs.push({ type: 'error', message: errMsg });
+      logs.push({ type: 'info', message: '' });
     }
 
     if (i < maxTransaction) {
       const delayMsg = `Waiting ${delaySeconds} seconds before next transaction...`;
-      logger.info(delayMsg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, delayMsg);
+      logs.push({ type: 'info', message: delayMsg });
       await delay(delaySeconds * 1000);
     }
   }
+
+  return { logs };
 }
 
-async function getFaucetPrivateKey(isTelegram, telegramBot = null, chatId = null, selectedWalletName = null) {
+async function getFaucetPrivateKey(isTelegram, selectedWalletName = null) {
   let faucetPrivateKey = '';
   if (!isTelegram) {
     try {
@@ -398,61 +387,55 @@ async function getFaucetPrivateKey(isTelegram, telegramBot = null, chatId = null
   if (!faucetPrivateKey || !faucetPrivateKey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(faucetPrivateKey)) {
     const wallets = loadWallets();
     if (wallets.length === 0) {
-      const msg = `No valid wallets found in wallets.json.`;
-      logger.error(msg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-      return null;
+      return { success: false, message: `No valid wallets found in wallets.json.` };
     }
 
     let selectedWallet;
     if (selectedWalletName) {
       selectedWallet = wallets.find(w => w.name === selectedWalletName);
       if (!selectedWallet) {
-        const msg = `Wallet '${selectedWalletName}' not found in wallets.json.`;
-        logger.error(msg);
-        if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-        return null;
+        return { success: false, message: `Wallet '${selectedWalletName}' not found in wallets.json.` };
       }
     } else {
       selectedWallet = wallets.find(w => w.privatekey && w.privatekey.startsWith('0x') && /^(0x)[0-9a-fA-F]{64}$/.test(w.privatekey));
     }
 
     if (!selectedWallet) {
-      const msg = `No valid faucet private key found in wallets.json.`;
-      logger.error(msg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-      return null;
+      return { success: false, message: `No valid faucet private key found in wallets.json.` };
     }
 
     faucetPrivateKey = selectedWallet.privatekey;
   }
 
   if (!faucetPrivateKey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(faucetPrivateKey)) {
-    const msg = `Invalid faucet private key. Must start with '0x' and be a 64-character hexadecimal string.`;
-    logger.error(msg);
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-    return null;
+    return { success: false, message: `Invalid faucet private key. Must start with '0x' and be a 64-character hexadecimal string.` };
   }
 
-  return faucetPrivateKey;
+  return { success: true, faucetPrivateKey };
 }
 
 async function faucetTransferUSDC(faucetPrivateKeyOrWalletName, wallets, amountUSDC, delaySeconds, isTelegram = false, telegramBot = null, chatId = null) {
-  const faucetPrivateKey = await getFaucetPrivateKey(isTelegram, telegramBot, chatId, isTelegram ? faucetPrivateKeyOrWalletName : null);
-  if (!faucetPrivateKey) return;
+  const logs = [];
+  const faucetKeyResult = await getFaucetPrivateKey(isTelegram, isTelegram ? faucetPrivateKeyOrWalletName : null);
+  if (!faucetKeyResult.success) {
+    logs.push({ type: 'error', message: faucetKeyResult.message });
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, faucetKeyResult.message);
+    return { logs };
+  }
 
+  const faucetPrivateKey = faucetKeyResult.faucetPrivateKey;
   const faucetWallet = new ethers.Wallet(faucetPrivateKey, provider());
   const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, faucetWallet);
   const msg = `Checking faucet wallet balance (${faucetWallet.address})...`;
-  logger.loading(msg);
+  logs.push({ type: 'loading', message: msg });
   if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
   const faucetBalance = await usdcContract.balanceOf(faucetWallet.address);
   const faucetBalanceUSDC = parseFloat(ethers.formatUnits(faucetBalance, 6));
   if (faucetBalanceUSDC < amountUSDC * wallets.length) {
     const errMsg = `Faucet wallet ${faucetWallet.address} has insufficient USDC. Required: ${amountUSDC * wallets.length} USDC, Available: ${faucetBalanceUSDC} USDC`;
-    logger.error(errMsg);
+    logs.push({ type: 'error', message: errMsg });
     if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
-    return;
+    return { logs };
   }
 
   const formattedAmount = parseFloat(amountUSDC.toFixed(6));
@@ -462,7 +445,7 @@ async function faucetTransferUSDC(faucetPrivateKeyOrWalletName, wallets, amountU
     const walletInfo = wallets[i];
     if (!walletInfo.privatekey || !walletInfo.privatekey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
       const msg = `Skipping wallet '${walletInfo.name}': Invalid private key.`;
-      logger.warn(msg);
+      logs.push({ type: 'warn', message: msg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
       continue;
     }
@@ -472,50 +455,58 @@ async function faucetTransferUSDC(faucetPrivateKeyOrWalletName, wallets, amountU
       recipientWallet = new ethers.Wallet(walletInfo.privatekey, provider());
     } catch (err) {
       const msg = `Skipping wallet '${walletInfo.name}': Failed to create wallet - ${err.message}`;
-      logger.warn(msg);
+      logs.push({ type: 'warn', message: msg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
       continue;
     }
 
     const stepMsg = `Transferring ${formattedAmount} USDC to ${recipientWallet.address} (${walletInfo.name})`;
-    logger.step(stepMsg);
+    logs.push({ type: 'step', message: stepMsg });
     if (telegramBot && chatId) telegramBot.sendMessage(chatId, stepMsg);
     try {
       const tx = await usdcContract.transfer(recipientWallet.address, amountWei);
       const receipt = await tx.wait();
       const successMsg = `${timelog()} | USDC Transfer Confirmed: ${explorer.tx(receipt.hash)}`;
-      logger.success(successMsg);
+      logs.push({ type: 'success', message: successMsg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
     } catch (err) {
       const errMsg = `USDC Transfer failed for ${recipientWallet.address}: ${err.message}`;
-      logger.error(errMsg);
+      logs.push({ type: 'error', message: errMsg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
     }
 
     if (i < wallets.length - 1) {
       const delayMsg = `Waiting ${delaySeconds} seconds before next transfer...`;
-      logger.info(delayMsg);
+      logs.push({ type: 'info', message: delayMsg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, delayMsg);
       await delay(delaySeconds * 1000);
     }
   }
+
+  return { logs };
 }
 
 async function faucetTransferETH(faucetPrivateKeyOrWalletName, wallets, amountETH, delaySeconds, isTelegram = false, telegramBot = null, chatId = null) {
-  const faucetPrivateKey = await getFaucetPrivateKey(isTelegram, telegramBot, chatId, isTelegram ? faucetPrivateKeyOrWalletName : null);
-  if (!faucetPrivateKey) return;
+  const logs = [];
+  const faucetKeyResult = await getFaucetPrivateKey(isTelegram, isTelegram ? faucetPrivateKeyOrWalletName : null);
+  if (!faucetKeyResult.success) {
+    logs.push({ type: 'error', message: faucetKeyResult.message });
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, faucetKeyResult.message);
+    return { logs };
+  }
 
+  const faucetPrivateKey = faucetKeyResult.faucetPrivateKey;
   const faucetWallet = new ethers.Wallet(faucetPrivateKey, provider());
   const msg = `Checking faucet wallet balance (${faucetWallet.address})...`;
-  logger.loading(msg);
+  logs.push({ type: 'loading', message: msg });
   if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
   const faucetBalance = await provider().getBalance(faucetWallet.address);
   const faucetBalanceETH = parseFloat(ethers.formatEther(faucetBalance));
   if (faucetBalanceETH < amountETH * wallets.length) {
     const errMsg = `Faucet wallet ${faucetWallet.address} has insufficient ETH. Required: ${amountETH * wallets.length} ETH, Available: ${faucetBalanceETH} ETH`;
-    logger.error(errMsg);
+    logs.push({ type: 'error', message: errMsg });
     if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
-    return;
+    return { logs };
   }
 
   const formattedAmount = parseFloat(amountETH.toFixed(18));
@@ -525,7 +516,7 @@ async function faucetTransferETH(faucetPrivateKeyOrWalletName, wallets, amountET
     const walletInfo = wallets[i];
     if (!walletInfo.privatekey || !walletInfo.privatekey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
       const msg = `Skipping wallet '${walletInfo.name}': Invalid private key.`;
-      logger.warn(msg);
+      logs.push({ type: 'warn', message: msg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
       continue;
     }
@@ -535,13 +526,13 @@ async function faucetTransferETH(faucetPrivateKeyOrWalletName, wallets, amountET
       recipientWallet = new ethers.Wallet(walletInfo.privatekey, provider());
     } catch (err) {
       const msg = `Skipping wallet '${walletInfo.name}': Failed to create wallet - ${err.message}`;
-      logger.warn(msg);
+      logs.push({ type: 'warn', message: msg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
       continue;
     }
 
     const stepMsg = `Transferring ${formattedAmount} ETH to ${recipientWallet.address} (${walletInfo.name})`;
-    logger.step(stepMsg);
+    logs.push({ type: 'step', message: stepMsg });
     if (telegramBot && chatId) telegramBot.sendMessage(chatId, stepMsg);
     try {
       const tx = await faucetWallet.sendTransaction({
@@ -550,21 +541,23 @@ async function faucetTransferETH(faucetPrivateKeyOrWalletName, wallets, amountET
       });
       const receipt = await tx.wait();
       const successMsg = `${timelog()} | ETH Transfer Confirmed: ${explorer.tx(receipt.hash)}`;
-      logger.success(successMsg);
+      logs.push({ type: 'success', message: successMsg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
     } catch (err) {
       const errMsg = `ETH Transfer failed for ${recipientWallet.address}: ${err.message}`;
-      logger.error(errMsg);
+      logs.push({ type: 'error', message: errMsg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
     }
 
     if (i < wallets.length - 1) {
       const delayMsg = `Waiting ${delaySeconds} seconds before next transfer...`;
-      logger.info(delayMsg);
+      logs.push({ type: 'info', message: delayMsg });
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, delayMsg);
       await delay(delaySeconds * 1000);
     }
   }
+
+  return { logs };
 }
 
 const MIN_TRANSACTIONS = 1;
@@ -710,15 +703,30 @@ async function mainConsole() {
     }
 
     if (choice === 1) {
-      await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'holesky', minPercent, maxPercent, delaySeconds);
+      const result = await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'holesky', minPercent, maxPercent, delaySeconds);
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+      });
     } else if (choice === 2) {
-      await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'babylon', minPercent, maxPercent, delaySeconds);
+      const result = await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'babylon', minPercent, maxPercent, delaySeconds);
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+      });
     } else if (choice === 3) {
-      await processWalletsInThreads(validWallets, numThreads, 'sendFromWalletRandom', maxTransaction, minPercent, maxPercent, delaySeconds);
+      const result = await processWalletsInThreads(validWallets, numThreads, 'sendFromWalletRandom', maxTransaction, minPercent, maxPercent, delaySeconds);
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+      });
     } else if (choice === 5) {
-      await faucetTransferUSDC(null, validWallets, amountUSDC, delaySeconds, false);
+      const result = await faucetTransferUSDC(null, validWallets, amountUSDC, delaySeconds, false);
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+      });
     } else if (choice === 6) {
-      await faucetTransferETH(null, validWallets, amountETH, delaySeconds, false);
+      const result = await faucetTransferETH(null, validWallets, amountETH, delaySeconds, false);
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+      });
     }
 
     if (validWallets.length === 0) {
@@ -1106,13 +1114,19 @@ function mainTelegram() {
         return;
       }
 
+      let result;
       if (destination === 'holesky') {
-        await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'holesky', minPercent, maxPercent, delaySeconds, bot, chatId);
+        result = await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'holesky', minPercent, maxPercent, delaySeconds);
       } else if (destination === 'babylon') {
-        await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'babylon', minPercent, maxPercent, delaySeconds, bot, chatId);
+        result = await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'babylon', minPercent, maxPercent, delaySeconds);
       } else if (destination === 'random') {
-        await processWalletsInThreads(validWallets, numThreads, 'sendFromWalletRandom', maxTransaction, minPercent, maxPercent, delaySeconds, bot, chatId);
+        result = await processWalletsInThreads(validWallets, numThreads, 'sendFromWalletRandom', maxTransaction, minPercent, maxPercent, delaySeconds);
       }
+
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+        if (log.message) bot.sendMessage(chatId, log.message);
+      });
 
       bot.sendMessage(chatId, 'Transaction process completed.', {
         reply_markup: {
@@ -1196,11 +1210,17 @@ function mainTelegram() {
         },
       });
 
+      let result;
       if (state.faucetType === 'usdc') {
-        await faucetTransferUSDC(state.faucetWalletName, validWallets, state.amount, delaySeconds, true, bot, chatId);
+        result = await faucetTransferUSDC(state.faucetWalletName, validWallets, state.amount, delaySeconds, true, bot, chatId);
       } else if (state.faucetType === 'eth') {
-        await faucetTransferETH(state.faucetWalletName, validWallets, state.amount, delaySeconds, true, bot, chatId);
+        result = await faucetTransferETH(state.faucetWalletName, validWallets, state.amount, delaySeconds, true, bot, chatId);
       }
+
+      result.logs.forEach(log => {
+        logger[log.type](log.message);
+        if (log.message && telegramBot && chatId) telegramBot.sendMessage(chatId, log.message);
+      });
 
       bot.sendMessage(chatId, 'Faucet transfer process completed.', {
         reply_markup: {
@@ -1218,6 +1238,7 @@ async function processWalletsInThreads(wallets, numThreads, processFunction, ...
   const threadCount = Math.min(numThreads, wallets.length, MAX_THREADS);
   const walletsPerThread = Math.ceil(wallets.length / threadCount);
   const tasks = [];
+  const allLogs = [];
 
   for (let i = 0; i < threadCount; i++) {
     const start = i * walletsPerThread;
@@ -1228,13 +1249,18 @@ async function processWalletsInThreads(wallets, numThreads, processFunction, ...
     }
   }
 
-  await Promise.all(tasks);
+  const results = await Promise.all(tasks);
+  results.forEach(result => {
+    if (result.logs) allLogs.push(...result.logs);
+  });
+
+  return { logs: allLogs };
 }
 
 async function runWorker(workerData) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(__filename, { workerData });
-    worker.on('message', resolve);
+    worker.on('message', (result) => resolve(result));
     worker.on('error', reject);
     worker.on('exit', (code) => {
       if (code !== 0) reject(new Error(`Worker stopped with exit code ${code}`));
@@ -1259,24 +1285,25 @@ if (isMainThread) {
 
   main();
 } else {
-  async function sendFromWalletRandom(walletInfo, maxTransaction, minPercent, maxPercent, delaySeconds, telegramBot = null, chatId = null) {
+  async function sendFromWalletRandom(walletInfo, maxTransaction, minPercent, maxPercent, delaySeconds) {
+    const logs = [];
     const destinations = ['holesky', 'babylon'].filter(dest => dest !== 'babylon' || walletInfo.babylonAddress);
     if (destinations.length === 0) {
       const msg = `Skipping wallet '${walletInfo.name}': No valid destinations (missing babylonAddress).`;
-      logger.warn(msg);
-      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
-      return;
+      logs.push({ type: 'warn', message: msg });
+      return { logs };
     }
     for (let i = 0; i < maxTransaction; i++) {
       const randomDest = destinations[Math.floor(Math.random() * destinations.length)];
-      await sendFromWallet(walletInfo, 1, randomDest, minPercent, maxPercent, delaySeconds, telegramBot, chatId);
+      const result = await sendFromWallet(walletInfo, 1, randomDest, minPercent, maxPercent, delaySeconds);
+      logs.push(...result.logs);
       if (i < maxTransaction - 1) {
         const msg = `Waiting ${delaySeconds} seconds before next transaction...`;
-        logger.info(msg);
-        if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+        logs.push({ type: 'info', message: msg });
         await delay(delaySeconds * 1000);
       }
     }
+    return { logs };
   }
 
   const { wallets, processFunction, args } = workerData;
@@ -1288,14 +1315,16 @@ if (isMainThread) {
   }
 
   async function run() {
+    const allLogs = [];
     for (const walletInfo of wallets) {
-      await fn(walletInfo, ...args);
+      const result = await fn(walletInfo, ...args);
+      allLogs.push(...result.logs);
     }
-    parentPort.postMessage('done');
+    parentPort.postMessage({ logs: allLogs });
   }
 
   run().catch(err => {
     console.error(`Worker error: ${err.message}`);
-    parentPort.postMessage('error');
+    parentPort.postMessage({ logs: [{ type: 'error', message: `Worker error: ${err.message}` }] });
   });
 }
