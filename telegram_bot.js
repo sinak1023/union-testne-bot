@@ -5,9 +5,9 @@ const axios = require('axios');
 const moment = require('moment-timezone');
 const readline = require('readline');
 const TelegramBot = require('node-telegram-bot-api');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 require('dotenv').config();
 
-// تنظیمات رنگ‌ها
 const colors = {
   reset: "\x1b[0m",
   cyan: "\x1b[36m",
@@ -18,7 +18,6 @@ const colors = {
   bold: "\x1b[1m"
 };
 
-// تنظیمات لاگر
 const logger = {
   info: (msg) => console.log(`${colors.green}[✓] ${msg}${colors.reset}`),
   warn: (msg) => console.log(`${colors.yellow}[⚠] ${msg}${colors.reset}`),
@@ -29,13 +28,12 @@ const logger = {
   banner: () => {
     console.log(`${colors.cyan}${colors.bold}`);
     console.log(`---------------------------------------------`);
-    console.log(`  Union Testnet Auto Bot - Kachal God mod    `);
-    console.log(`---------------------------------------------${colors.reset}`);
+    console.log(`  Union Testnet Auto Bot - Kachal God Mod    `);
+    console.log(`---------------------------------------------`);
     console.log();
   }
 };
 
-// ABI قراردادها
 const UCS03_ABI = [
   {
     inputs: [
@@ -92,9 +90,19 @@ const USDC_ABI = [
     type: 'function',
     stateMutability: 'nonpayable',
   },
+  {
+    constant: false,
+    inputs: [
+      { name: 'to', type: 'address' },
+      { name: 'value', type: 'uint256' },
+    ],
+    name: 'transfer',
+    outputs: [{ name: '', type: 'bool' }],
+    type: 'function',
+    stateMutability: 'nonpayable',
+  },
 ];
 
-// تنظیمات ثابت
 const contractAddress = '0x5FbE74A283f7954f10AA04C2eDf55578811aeb03';
 const USDC_ADDRESS = '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238';
 const graphqlEndpoint = 'https://graphql.union.build/v1/graphql';
@@ -111,6 +119,32 @@ function provider() {
 function rotateRpcProvider() {
   currentRpcProviderIndex = (currentRpcProviderIndex + 1) % rpcProviders.length;
   return provider();
+}
+
+let proxies = [];
+try {
+  const proxiesContent = fs.readFileSync('proxies.txt', 'utf8');
+  proxies = proxiesContent.split('\n').map(proxy => proxy.trim()).filter(proxy => proxy);
+} catch (err) {
+  logger.warn(`No proxies.txt found or error reading: ${err.message}. Running without proxies.`);
+}
+
+function getAxiosConfig() {
+  if (proxies.length > 0) {
+    const proxy = proxies[Math.floor(Math.random() * proxies.length)];
+    return {
+      proxy: {
+        protocol: 'http',
+        host: proxy.split('@')[1]?.split(':')[0] || proxy.split('://')[1].split(':')[0],
+        port: parseInt(proxy.split('@')[1]?.split(':')[1] || proxy.split('://')[1].split(':')[1]),
+        auth: proxy.includes('@') ? {
+          username: proxy.split('://')[1].split('@')[0].split(':')[0],
+          password: proxy.split('://')[1].split('@')[0].split(':')[1]
+        } : undefined
+      }
+    };
+  }
+  return {};
 }
 
 const rl = readline.createInterface({
@@ -142,10 +176,8 @@ function header() {
   logger.banner();
 }
 
-// مسیر فایل برای ذخیره کیف‌پول‌ها
 const WALLET_FILE = path.join(__dirname, 'wallets.json');
 
-// تابع برای بارگذاری کیف‌پول‌ها از فایل
 function loadWallets() {
   try {
     if (fs.existsSync(WALLET_FILE)) {
@@ -158,7 +190,6 @@ function loadWallets() {
   }
 }
 
-// تابع برای ذخیره کیف‌پول‌ها در فایل
 function saveWallets(wallets) {
   try {
     fs.writeFileSync(WALLET_FILE, JSON.stringify(wallets, null, 2));
@@ -168,34 +199,7 @@ function saveWallets(wallets) {
   }
 }
 
-// تابع بررسی موجودی و تأیید USDC
-async function checkBalanceAndApprove(wallet, usdcAddress, spenderAddress) {
-  const usdcContract = new ethers.Contract(usdcAddress, USDC_ABI, wallet);
-  const balance = await usdcContract.balanceOf(wallet.address);
-  if (balance === 0n) {
-    logger.error(`${wallet.address} not have enough USDC. Fund your wallet first!`);
-    return false;
-  }
-
-  const allowance = await usdcContract.allowance(wallet.address, spenderAddress);
-  if (allowance === 0n) {
-    logger.loading(`USDC is not allowance. Sending approve transaction....`);
-    const approveAmount = ethers.MaxUint256;
-    try {
-      const tx = await usdcContract.approve(spenderAddress, approveAmount);
-      const receipt = await tx.wait();
-      logger.success(`Approve confirmed: ${explorer.tx(receipt.hash)}`);
-      await delay(3000);
-    } catch (err) {
-      logger.error(`Approve failed: ${err.message}`);
-      return false;
-    }
-  }
-  return true;
-}
-
-// تابع ارسال پکت
-async function pollPacketHash(txHash, retries = 50, intervalMs = 5000) {
+async function pollPacketHash(txHash, retries = 50, intervalMs = 5000, telegramBot = null, chatId = null) {
   const headers = {
     accept: 'application/graphql-response+json, application/json',
     'accept-encoding': 'gzip, deflate, br, zstd',
@@ -220,22 +224,59 @@ async function pollPacketHash(txHash, retries = 50, intervalMs = 5000) {
 
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await axios.post(graphqlEndpoint, data, { headers });
+      const res = await axios.post(graphqlEndpoint, data, { headers, ...getAxiosConfig() });
       const result = res.data?.data?.v2_transfers;
       if (result && result.length > 0 && result[0].packet_hash) {
         return result[0].packet_hash;
       }
     } catch (e) {
-      logger.error(`Packet error: ${e.message}`);
+      const msg = `Packet error: ${e.message}`;
+      logger.error(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
     }
     await delay(intervalMs);
   }
-  logger.warn(`No packet hash found after ${retries} retries.`);
+  const msg = `No packet hash found after ${retries} retries.`;
+  logger.warn(msg);
+  if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
   return null;
 }
 
-// تابع ارسال تراکنش از کیف‌پول
-async function sendFromWallet(walletInfo, maxTransaction, destination, telegramBot = null, chatId = null) {
+async function checkBalanceAndApprove(wallet, usdcAddress, spenderAddress, amountUSDC, numTransactions, telegramBot = null, chatId = null) {
+  const usdcContract = new ethers.Contract(usdcAddress, USDC_ABI, wallet);
+  const balance = await usdcContract.balanceOf(wallet.address);
+  const requiredBalance = ethers.parseUnits(amountUSDC.toString(), 6) * BigInt(numTransactions);
+  if (balance < requiredBalance) {
+    const msg = `${wallet.address} does not have enough USDC. Required: ${ethers.formatUnits(requiredBalance, 6)} USDC, Available: ${ethers.formatUnits(balance, 6)} USDC`;
+    logger.error(msg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+    return false;
+  }
+
+  const allowance = await usdcContract.allowance(wallet.address, spenderAddress);
+  if (allowance < requiredBalance) {
+    const msg = `USDC allowance insufficient. Sending approve transaction...`;
+    logger.loading(msg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+    const approveAmount = ethers.MaxUint256;
+    try {
+      const tx = await usdcContract.approve(spenderAddress, approveAmount);
+      const receipt = await tx.wait();
+      const successMsg = `Approve confirmed: ${explorer.tx(receipt.hash)}`;
+      logger.success(successMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
+      await delay(3000);
+    } catch (err) {
+      const errMsg = `Approve failed: ${err.message}`;
+      logger.error(errMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
+      return false;
+    }
+  }
+  return true;
+}
+
+async function sendFromWallet(walletInfo, maxTransaction, destination, minPercent, maxPercent, delaySeconds, telegramBot = null, chatId = null) {
   const wallet = new ethers.Wallet(walletInfo.privatekey, provider());
   let recipientAddress, destinationName, channelId, operand;
 
@@ -260,20 +301,34 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, telegramB
     return;
   }
 
-  const msg = `Sending ${maxTransaction} Transaction Sepolia to ${destinationName} from ${wallet.address} (${walletInfo.name || 'Unnamed'})`;
+  const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, wallet);
+  const balance = await usdcContract.balanceOf(wallet.address);
+  const balanceUSDC = parseFloat(ethers.formatUnits(balance, 6));
+  if (balanceUSDC <= 0) {
+    const msg = `Wallet ${wallet.address} (${walletInfo.name || 'Unnamed'}) has no USDC balance.`;
+    logger.error(msg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+    return;
+  }
+
+  const minAmount = balanceUSDC * (minPercent / 100);
+  const maxAmount = balanceUSDC * (maxPercent / 100);
+  const amountUSDC = Math.random() * (maxAmount - minAmount) + minAmount;
+  const formattedAmount = parseFloat(amountUSDC.toFixed(6));
+
+  const msg = `Sending ${maxTransaction} Transaction(s) of ${formattedAmount} USDC Sepolia to ${destinationName} from ${wallet.address} (${walletInfo.name || 'Unnamed'})`;
   logger.loading(msg);
   if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
 
-  const shouldProceed = await checkBalanceAndApprove(wallet, USDC_ADDRESS, contractAddress);
-  if (!shouldProceed) {
-    if (telegramBot && chatId) telegramBot.sendMessage(chatId, `Failed to proceed with ${walletInfo.name || 'Unnamed'}: Insufficient USDC or approval failed.`);
-    return;
-  }
+  const shouldProceed = await checkBalanceAndApprove(wallet, USDC_ADDRESS, contractAddress, formattedAmount, maxTransaction, telegramBot, chatId);
+  if (!shouldProceed) return;
 
   const contract = new ethers.Contract(contractAddress, UCS03_ABI, wallet);
   const senderHex = wallet.address.slice(2).toLowerCase();
   const recipientHex = destination === 'babylon' ? Buffer.from(recipientAddress, "utf8").toString("hex") : senderHex;
   const timeoutHeight = 0;
+
+  const amountWei = ethers.parseUnits(formattedAmount.toString(), 6).toString(16).padStart(64, '0');
 
   if (destination === 'babylon') {
     operand = `0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000000000000000000000000000018000000000000000000000000000000000000000000000000000000000000001e00000000000000000000000000000000000000000000000000000000000002710000000000000000000000000000000000000000000000000000000000000022000000000000000000000000000000000000000000000000000000000000002600000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002a000000000000000000000000000000000000000000000000000000000000027100000000000000000000000000000000000000000000000000000000000000014${senderHex}000000000000000000000000000000000000000000000000000000000000000000000000000000000000002a${recipientHex}0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000141c7d4b196cb0c7b01d743fbc6116a902379c72380000000000000000000000000000000000000000000000000000000000000000000000000000000000000004555344430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045553444300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003e62626e317a7372763233616b6b6778646e77756c3732736674677632786a74356b68736e743377776a687030666668363833687a7035617135613068366e0000`;
@@ -282,7 +337,9 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, telegramB
   }
 
   for (let i = 1; i <= maxTransaction; i++) {
-    logger.step((walletInfo.name || 'Unnamed') + ' | Transaction ' + i + '/' + maxTransaction);
+    const stepMsg = `${walletInfo.name || 'Unnamed'} | Transaction ${i}/${maxTransaction} (${formattedAmount} USDC)`;
+    logger.step(stepMsg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, stepMsg);
     const now = BigInt(Date.now()) * 1_000_000n;
     const oneDayNs = 86_400_000_000_000n;
     const timeoutTimestamp = (now + oneDayNs).toString();
@@ -301,7 +358,7 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, telegramB
       logger.success(successMsg);
       if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
       const txHash = tx.hash.startsWith('0x') ? tx.hash : `0x${tx.hash}`;
-      const packetHash = await pollPacketHash(txHash);
+      const packetHash = await pollPacketHash(txHash, 50, 5000, telegramBot, chatId);
       if (packetHash) {
         const packetMsg = `${timelog()} | ${walletInfo.name || 'Unnamed'} | Packet Submitted: ${union.tx(packetHash)}`;
         logger.success(packetMsg);
@@ -316,35 +373,243 @@ async function sendFromWallet(walletInfo, maxTransaction, destination, telegramB
     }
 
     if (i < maxTransaction) {
-      await delay(1000);
+      const delayMsg = `Waiting ${delaySeconds} seconds before next transaction...`;
+      logger.info(delayMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, delayMsg);
+      await delay(delaySeconds * 1000);
     }
   }
 }
 
-// تابع اصلی برای حالت خط فرمان
+async function getFaucetPrivateKey(isTelegram, telegramBot = null, chatId = null, selectedWalletName = null) {
+  let faucetPrivateKey = '';
+  if (!isTelegram) {
+    try {
+      const faucetContent = fs.readFileSync('faucet.txt', 'utf8');
+      const faucetKeys = faucetContent.split('\n').map(key => key.trim()).filter(key => key);
+      if (faucetKeys.length > 0) {
+        faucetPrivateKey = faucetKeys[0];
+      }
+    } catch (err) {
+      logger.warn(`Failed to read faucet.txt: ${err.message}. Falling back to wallets.json.`);
+    }
+  }
+
+  if (!faucetPrivateKey || !faucetPrivateKey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(faucetPrivateKey)) {
+    const wallets = loadWallets();
+    if (wallets.length === 0) {
+      const msg = `No valid wallets found in wallets.json.`;
+      logger.error(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      return null;
+    }
+
+    let selectedWallet;
+    if (selectedWalletName) {
+      selectedWallet = wallets.find(w => w.name === selectedWalletName);
+      if (!selectedWallet) {
+        const msg = `Wallet '${selectedWalletName}' not found in wallets.json.`;
+        logger.error(msg);
+        if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+        return null;
+      }
+    } else {
+      selectedWallet = wallets.find(w => w.privatekey && w.privatekey.startsWith('0x') && /^(0x)[0-9a-fA-F]{64}$/.test(w.privatekey));
+    }
+
+    if (!selectedWallet) {
+      const msg = `No valid faucet private key found in wallets.json.`;
+      logger.error(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      return null;
+    }
+
+    faucetPrivateKey = selectedWallet.privatekey;
+  }
+
+  if (!faucetPrivateKey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(faucetPrivateKey)) {
+    const msg = `Invalid faucet private key. Must start with '0x' and be a 64-character hexadecimal string.`;
+    logger.error(msg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+    return null;
+  }
+
+  return faucetPrivateKey;
+}
+
+async function faucetTransferUSDC(faucetPrivateKeyOrWalletName, wallets, amountUSDC, delaySeconds, isTelegram = false, telegramBot = null, chatId = null) {
+  const faucetPrivateKey = await getFaucetPrivateKey(isTelegram, telegramBot, chatId, isTelegram ? faucetPrivateKeyOrWalletName : null);
+  if (!faucetPrivateKey) return;
+
+  const faucetWallet = new ethers.Wallet(faucetPrivateKey, provider());
+  const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, faucetWallet);
+  const msg = `Checking faucet wallet balance (${faucetWallet.address})...`;
+  logger.loading(msg);
+  if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+  const faucetBalance = await usdcContract.balanceOf(faucetWallet.address);
+  const faucetBalanceUSDC = parseFloat(ethers.formatUnits(faucetBalance, 6));
+  if (faucetBalanceUSDC < amountUSDC * wallets.length) {
+    const errMsg = `Faucet wallet ${faucetWallet.address} has insufficient USDC. Required: ${amountUSDC * wallets.length} USDC, Available: ${faucetBalanceUSDC} USDC`;
+    logger.error(errMsg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
+    return;
+  }
+
+  const formattedAmount = parseFloat(amountUSDC.toFixed(6));
+  const amountWei = ethers.parseUnits(formattedAmount.toString(), 6);
+
+  for (let i = 0; i < wallets.length; i++) {
+    const walletInfo = wallets[i];
+    if (!walletInfo.privatekey || !walletInfo.privatekey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
+      const msg = `Skipping wallet '${walletInfo.name}': Invalid private key.`;
+      logger.warn(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      continue;
+    }
+
+    let recipientWallet;
+    try {
+      recipientWallet = new ethers.Wallet(walletInfo.privatekey, provider());
+    } catch (err) {
+      const msg = `Skipping wallet '${walletInfo.name}': Failed to create wallet - ${err.message}`;
+      logger.warn(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      continue;
+    }
+
+    const stepMsg = `Transferring ${formattedAmount} USDC to ${recipientWallet.address} (${walletInfo.name})`;
+    logger.step(stepMsg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, stepMsg);
+    try {
+      const tx = await usdcContract.transfer(recipientWallet.address, amountWei);
+      const receipt = await tx.wait();
+      const successMsg = `${timelog()} | USDC Transfer Confirmed: ${explorer.tx(receipt.hash)}`;
+      logger.success(successMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
+    } catch (err) {
+      const errMsg = `USDC Transfer failed for ${recipientWallet.address}: ${err.message}`;
+      logger.error(errMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
+    }
+
+    if (i < wallets.length - 1) {
+      const delayMsg = `Waiting ${delaySeconds} seconds before next transfer...`;
+      logger.info(delayMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, delayMsg);
+      await delay(delaySeconds * 1000);
+    }
+  }
+}
+
+async function faucetTransferETH(faucetPrivateKeyOrWalletName, wallets, amountETH, delaySeconds, isTelegram = false, telegramBot = null, chatId = null) {
+  const faucetPrivateKey = await getFaucetPrivateKey(isTelegram, telegramBot, chatId, isTelegram ? faucetPrivateKeyOrWalletName : null);
+  if (!faucetPrivateKey) return;
+
+  const faucetWallet = new ethers.Wallet(faucetPrivateKey, provider());
+  const msg = `Checking faucet wallet balance (${faucetWallet.address})...`;
+  logger.loading(msg);
+  if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+  const faucetBalance = await provider().getBalance(faucetWallet.address);
+  const faucetBalanceETH = parseFloat(ethers.formatEther(faucetBalance));
+  if (faucetBalanceETH < amountETH * wallets.length) {
+    const errMsg = `Faucet wallet ${faucetWallet.address} has insufficient ETH. Required: ${amountETH * wallets.length} ETH, Available: ${faucetBalanceETH} ETH`;
+    logger.error(errMsg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
+    return;
+  }
+
+  const formattedAmount = parseFloat(amountETH.toFixed(18));
+  const amountWei = ethers.parseEther(formattedAmount.toString());
+
+  for (let i = 0; i < wallets.length; i++) {
+    const walletInfo = wallets[i];
+    if (!walletInfo.privatekey || !walletInfo.privatekey.startsWith('0x') || !/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
+      const msg = `Skipping wallet '${walletInfo.name}': Invalid private key.`;
+      logger.warn(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      continue;
+    }
+
+    let recipientWallet;
+    try {
+      recipientWallet = new ethers.Wallet(walletInfo.privatekey, provider());
+    } catch (err) {
+      const msg = `Skipping wallet '${walletInfo.name}': Failed to create wallet - ${err.message}`;
+      logger.warn(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      continue;
+    }
+
+    const stepMsg = `Transferring ${formattedAmount} ETH to ${recipientWallet.address} (${walletInfo.name})`;
+    logger.step(stepMsg);
+    if (telegramBot && chatId) telegramBot.sendMessage(chatId, stepMsg);
+    try {
+      const tx = await faucetWallet.sendTransaction({
+        to: recipientWallet.address,
+        value: amountWei
+      });
+      const receipt = await tx.wait();
+      const successMsg = `${timelog()} | ETH Transfer Confirmed: ${explorer.tx(receipt.hash)}`;
+      logger.success(successMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, successMsg);
+    } catch (err) {
+      const errMsg = `ETH Transfer failed for ${recipientWallet.address}: ${err.message}`;
+      logger.error(errMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, errMsg);
+    }
+
+    if (i < wallets.length - 1) {
+      const delayMsg = `Waiting ${delaySeconds} seconds before next transfer...`;
+      logger.info(delayMsg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, delayMsg);
+      await delay(delaySeconds * 1000);
+    }
+  }
+}
+
+const MIN_TRANSACTIONS = 1;
+const MAX_TRANSACTIONS = 100;
+const MIN_THREADS = 1;
+const MAX_THREADS = 10;
+const MIN_PERCENT = 0.01;
+const MAX_PERCENT = 100;
+const MIN_DELAY = 0;
+const MAX_DELAY = 60;
+
 async function mainConsole() {
   header();
 
   let wallets = loadWallets();
   if (wallets.length === 0) {
-    wallets = [];
-    let index = 1;
-    while (true) {
-      const privateKey = process.env[`PRIVATE_KEY_${index}`];
-      const babylonAddress = process.env[`BABYLON_ADDRESS_${index}`];
-      if (!privateKey) break;
-      wallets.push({
-        name: `Wallet${index}`,
-        privatekey: privateKey,
-        babylonAddress: babylonAddress || ''
-      });
-      index++;
+    let privateKeys = [];
+    try {
+      const privateKeysContent = fs.readFileSync('private_keys.txt', 'utf8');
+      privateKeys = privateKeysContent.split('\n').map(key => key.trim()).filter(key => key);
+    } catch (err) {
+      logger.error(`Failed to read private_keys.txt: ${err.message}`);
     }
+
+    let babylonAddress = '';
+    try {
+      const babylonAddressesContent = fs.readFileSync('BABYLON_ADDRESS.txt', 'utf8');
+      const addresses = babylonAddressesContent.split('\n').map(addr => addr.trim()).filter(addr => addr);
+      if (addresses.length > 0) {
+        babylonAddress = addresses[0];
+      }
+    } catch (err) {
+      logger.error(`Failed to read BABYLON_ADDRESS.txt: ${err.message}`);
+    }
+
+    wallets = privateKeys.map((privateKey, index) => ({
+      name: `Wallet${index + 1}`,
+      privatekey: privateKey,
+      babylonAddress
+    }));
     saveWallets(wallets);
   }
 
   if (wallets.length === 0) {
-    logger.error(`No wallets found in .env or wallets.json. Please provide at least one PRIVATE_KEY_X.`);
+    logger.error(`No valid wallets found. Ensure private_keys.txt or wallets.json contains valid entries.`);
     process.exit(1);
   }
 
@@ -354,7 +619,9 @@ async function mainConsole() {
     console.log(`2. Sepolia - Babylon`);
     console.log(`3. Random (Holesky and Babylon)`);
     console.log(`4. Exit`);
-    const menuChoice = await askQuestion(`${colors.cyan}[?] Select menu option (1-4): ${colors.reset}`);
+    console.log(`5. Faucet USDC Transfer (Sepolia)`);
+    console.log(`6. Faucet ETH Transfer (Sepolia)`);
+    const menuChoice = await askQuestion(`${colors.cyan}[?] Select menu option (1-6): ${colors.reset}`);
     const choice = parseInt(menuChoice.trim());
 
     if (choice === 4) {
@@ -363,60 +630,103 @@ async function mainConsole() {
       process.exit(0);
     }
 
-    if (![1, 2, 3].includes(choice)) {
-      logger.error(`Invalid option. Please select 1, 2, 3, or 4.`);
+    if (![1, 2, 3, 5, 6].includes(choice)) {
+      logger.error(`Invalid option. Please select 1, 2, 3, 4, 5, or 6.`);
       continue;
     }
 
-    const maxTransactionInput = await askQuestion(`${colors.cyan}[?] Enter the number of transactions per wallet: ${colors.reset}`);
-    const maxTransaction = parseInt(maxTransactionInput.trim());
+    let numThreads, maxTransaction, minPercent, maxPercent, amountUSDC, amountETH, delaySeconds;
 
-    if (isNaN(maxTransaction) || maxTransaction <= 0) {
-      logger.error(`Invalid number. Please enter a positive number.`);
+    const delayInput = await askQuestion(`${colors.cyan}[?] Enter delay between transactions RECOMMENDED FOR LOWER GAS USE (seconds, ${MIN_DELAY}-${MAX_DELAY}): ${colors.reset}`);
+    delaySeconds = parseFloat(delayInput.trim());
+    if (isNaN(delaySeconds) || delaySeconds < MIN_DELAY || delaySeconds > MAX_DELAY) {
+      logger.error(`Invalid delay. Please enter a number between ${MIN_DELAY} and ${MAX_DELAY} seconds.`);
       continue;
     }
 
-    for (const walletInfo of wallets) {
+    if (choice === 1 || choice === 2 || choice === 3) {
+      const numThreadsInput = await askQuestion(`${colors.cyan}[?] Enter the number of threads [${MIN_THREADS}-${MAX_THREADS}]: ${colors.reset}`);
+      numThreads = parseInt(numThreadsInput.trim());
+      if (isNaN(numThreads) || numThreads < MIN_THREADS || numThreads > MAX_THREADS) {
+        logger.error(`Invalid number. Please enter a number between ${MIN_THREADS} and ${MAX_THREADS}.`);
+        continue;
+      }
+
+      const maxTransactionInput = await askQuestion(`${colors.cyan}[?] Enter the number of transactions per wallet [${MIN_TRANSACTIONS}-${MAX_TRANSACTIONS}]: ${colors.reset}`);
+      maxTransaction = parseInt(maxTransactionInput.trim());
+      if (isNaN(maxTransaction) || maxTransaction < MIN_TRANSACTIONS || maxTransaction > MAX_TRANSACTIONS) {
+        logger.error(`Invalid number. Please enter a number between ${MIN_TRANSACTIONS} and ${MAX_TRANSACTIONS}.`);
+        continue;
+      }
+
+      const minPercentInput = await askQuestion(`${colors.cyan}[?] Enter the minimum percentage of USDC balance to use [${MIN_PERCENT}-${MAX_PERCENT}]: ${colors.reset}`);
+      minPercent = parseFloat(minPercentInput.trim());
+      if (isNaN(minPercent) || minPercent < MIN_PERCENT || minPercent > MAX_PERCENT) {
+        logger.error(`Invalid percentage. Please enter a number between ${MIN_PERCENT} and ${MAX_PERCENT}.`);
+        continue;
+      }
+
+      const maxPercentInput = await askQuestion(`${colors.cyan}[?] Enter the maximum percentage of USDC balance to use [${minPercent}-${MAX_PERCENT}]: ${colors.reset}`);
+      maxPercent = parseFloat(maxPercentInput.trim());
+      if (isNaN(maxPercent) || maxPercent < minPercent || maxPercent > MAX_PERCENT) {
+        logger.error(`Invalid percentage. Please enter a number between ${minPercent} and ${MAX_PERCENT}.`);
+        continue;
+      }
+    } else if (choice === 5) {
+      const amountUSDCInput = await askQuestion(`${colors.cyan}[?] Enter the exact USDC amount to transfer per wallet (e.g., 10.5): ${colors.reset}`);
+      amountUSDC = parseFloat(amountUSDCInput.trim());
+      if (isNaN(amountUSDC) || amountUSDC <= 0) {
+        logger.error(`Invalid USDC amount. Please enter a positive number.`);
+        continue;
+      }
+    } else if (choice === 6) {
+      const amountETHInput = await askQuestion(`${colors.cyan}[?] Enter the exact ETH amount to transfer per wallet (e.g., 0.01): ${colors.reset}`);
+      amountETH = parseFloat(amountETHInput.trim());
+      if (isNaN(amountETH) || amountETH <= 0) {
+        logger.error(`Invalid ETH amount. Please enter a positive number.`);
+        continue;
+      }
+    }
+
+    const validWallets = wallets.filter(walletInfo => {
       if (!walletInfo.privatekey) {
         logger.warn(`Skipping wallet '${walletInfo.name}': Missing privatekey.`);
-        continue;
+        return false;
       }
       if (!walletInfo.privatekey.startsWith('0x')) {
         logger.warn(`Skipping wallet '${walletInfo.name}': Privatekey must start with '0x'.`);
-        continue;
+        return false;
       }
       if (!/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
         logger.warn(`Skipping wallet '${walletInfo.name}': Privatekey is not a valid 64-character hexadecimal string.`);
-        continue;
+        return false;
       }
+      return true;
+    });
 
-      if (choice === 1) {
-        await sendFromWallet(walletInfo, maxTransaction, 'holesky');
-      } else if (choice === 2) {
-        await sendFromWallet(walletInfo, maxTransaction, 'babylon');
-      } else if (choice === 3) {
-        const destinations = ['holesky', 'babylon'].filter(dest => dest !== 'babylon' || walletInfo.babylonAddress);
-        if (destinations.length === 0) {
-          logger.warn(`Skipping wallet '${walletInfo.name}': No valid destinations (missing babylonAddress).`);
-          continue;
-        }
-        for (let i = 0; i < maxTransaction; i++) {
-          const randomDest = destinations[Math.floor(Math.random() * destinations.length)];
-          await sendFromWallet(walletInfo, 1, randomDest);
-          if (i < maxTransaction - 1) {
-            await delay(1000);
-          }
-        }
-      }
+    if (validWallets.length === 0) {
+      logger.warn(`No valid wallets to process. Check private_keys.txt or wallets.json for valid entries.`);
+      continue;
     }
 
-    if (wallets.length === 0) {
-      logger.warn(`No wallets processed. Check .env or wallets.json for valid entries.`);
+    if (choice === 1) {
+      await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'holesky', minPercent, maxPercent, delaySeconds);
+    } else if (choice === 2) {
+      await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'babylon', minPercent, maxPercent, delaySeconds);
+    } else if (choice === 3) {
+      await processWalletsInThreads(validWallets, numThreads, 'sendFromWalletRandom', maxTransaction, minPercent, maxPercent, delaySeconds);
+    } else if (choice === 5) {
+      await faucetTransferUSDC(null, validWallets, amountUSDC, delaySeconds, false);
+    } else if (choice === 6) {
+      await faucetTransferETH(null, validWallets, amountETH, delaySeconds, false);
+    }
+
+    if (validWallets.length === 0) {
+      logger.warn(`No wallets processed. Check private_keys.txt or wallets.json for valid entries.`);
     }
   }
 }
 
-// تابع اصلی برای حالت تلگرام
 function mainTelegram() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const allowedChatId = process.env.TELEGRAM_CHAT_ID;
@@ -427,30 +737,27 @@ function mainTelegram() {
   }
 
   const bot = new TelegramBot(token, { polling: true });
-  const userState = {}; // برای ذخیره وضعیت کاربران
+  const userState = {};
 
-  // دکمه‌های منوی اصلی
   const mainMenu = {
     reply_markup: {
       inline_keyboard: [
         [{ text: 'Add Wallet', callback_data: 'add_wallet' }],
         [{ text: 'List Wallets', callback_data: 'list_wallets' }],
         [{ text: 'Run Transactions', callback_data: 'run_transactions' }],
+        [{ text: 'Faucet Transfers', callback_data: 'faucet_transfers' }],
         [{ text: 'Help', callback_data: 'help' }],
       ],
     },
   };
 
-  // دکمه بازگشت به خانه
   const backToHomeButton = [{ text: 'Back to Home', callback_data: 'home' }];
 
-  // تابع نمایش منوی اصلی
   function showMainMenu(chatId, message = 'Welcome to Union Testnet Auto Bot! Choose an option:') {
-    delete userState[chatId]; // پاک کردن وضعیت کاربر
+    delete userState[chatId];
     bot.sendMessage(chatId, message, mainMenu);
   }
 
-  // مدیریت دستور /start
   bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id.toString();
     if (chatId !== allowedChatId) {
@@ -460,7 +767,6 @@ function mainTelegram() {
     showMainMenu(chatId);
   });
 
-  // مدیریت دکمه‌ها
   bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id.toString();
     if (chatId !== allowedChatId) {
@@ -472,21 +778,18 @@ function mainTelegram() {
     const data = query.data;
     bot.answerCallbackQuery(query.id);
 
-    // بازگشت به منوی اصلی
     if (data === 'home') {
       showMainMenu(chatId, 'Returned to main menu.');
       return;
     }
 
-    // نمایش منوی اصلی
     if (data === 'start') {
       showMainMenu(chatId);
       return;
     }
 
-    // نمایش راهنما
     if (data === 'help') {
-      bot.sendMessage(chatId, 'Available actions:\n- Add Wallet: Add a new wallet\n- List Wallets: View all wallets\n- Run Transactions: Execute transactions\n- Help: Show this message', {
+      bot.sendMessage(chatId, 'Available actions:\n- Add Wallet: Add a new wallet\n- List Wallets: View all wallets\n- Run Transactions: Execute transactions\n- Faucet Transfers: Transfer USDC or ETH\n- Help: Show this message', {
         reply_markup: {
           inline_keyboard: [backToHomeButton],
         },
@@ -494,7 +797,6 @@ function mainTelegram() {
       return;
     }
 
-    // افزودن کیف‌پول
     if (data === 'add_wallet') {
       userState[chatId] = { step: 'add_wallet_input' };
       bot.sendMessage(chatId, 'Please provide wallet details in the format:\nname: <wallet_name>\nprivatekey: <private_key>\nbabylonAddress: <babylon_address> (optional)', {
@@ -505,7 +807,6 @@ function mainTelegram() {
       return;
     }
 
-    // لیست کیف‌پول‌ها
     if (data === 'list_wallets') {
       const wallets = loadWallets();
       if (wallets.length === 0) {
@@ -525,7 +826,6 @@ function mainTelegram() {
       return;
     }
 
-    // اجرای تراکنش‌ها - انتخاب مقصد
     if (data === 'run_transactions') {
       userState[chatId] = { step: 'select_destination' };
       bot.sendMessage(chatId, 'Select destination:', {
@@ -541,11 +841,65 @@ function mainTelegram() {
       return;
     }
 
-    // انتخاب مقصد
+    if (data === 'faucet_transfers') {
+      userState[chatId] = { step: 'select_faucet_type' };
+      bot.sendMessage(chatId, 'Select faucet transfer type:', {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: 'USDC Transfer', callback_data: 'faucet_usdc' }],
+            [{ text: 'ETH Transfer', callback_data: 'faucet_eth' }],
+            backToHomeButton,
+          ],
+        },
+      });
+      return;
+    }
+
     if (data.startsWith('destination_')) {
       const destination = data.split('_')[1];
-      userState[chatId] = { step: 'enter_transactions', destination };
-      bot.sendMessage(chatId, 'Enter the number of transactions per wallet:', {
+      userState[chatId] = { step: 'enter_threads', destination };
+      bot.sendMessage(chatId, `Enter the number of threads [${MIN_THREADS}-${MAX_THREADS}]:`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      return;
+    }
+
+    if (data === 'faucet_usdc' || data === 'faucet_eth') {
+      const faucetType = data.split('_')[1];
+      const wallets = loadWallets();
+      if (wallets.length === 0) {
+        bot.sendMessage(chatId, 'No wallets found. Please add wallets first.', {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'select_faucet_wallet', faucetType };
+      const walletButtons = wallets.map(w => [{ text: w.name, callback_data: `wallet_${w.name}` }]);
+      walletButtons.push(backToHomeButton);
+      bot.sendMessage(chatId, 'Select the wallet to use as faucet:', {
+        reply_markup: {
+          inline_keyboard: walletButtons,
+        },
+      });
+      return;
+    }
+
+    if (data.startsWith('wallet_')) {
+      const walletName = data.split('_')[1];
+      if (!userState[chatId] || !userState[chatId].faucetType) {
+        bot.sendMessage(chatId, 'Error: Faucet type not selected. Please try again.', {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'enter_faucet_amount', faucetType: userState[chatId].faucetType, faucetWalletName: walletName };
+      bot.sendMessage(chatId, `Enter the exact ${userState[chatId].faucetType.toUpperCase()} amount to transfer per wallet (e.g., ${userState[chatId].faucetType === 'usdc' ? '10.5' : '0.01'}):`, {
         reply_markup: {
           inline_keyboard: [backToHomeButton],
         },
@@ -554,7 +908,6 @@ function mainTelegram() {
     }
   });
 
-  // مدیریت ورودی‌های متنی
   bot.on('message', async (msg) => {
     const chatId = msg.chat.id.toString();
     if (chatId !== allowedChatId) {
@@ -562,12 +915,10 @@ function mainTelegram() {
       return;
     }
 
-    // اگر پیام دستور است (مثل /start)، نادیده گرفته شود چون قبلاً مدیریت شده
     if (msg.text && msg.text.startsWith('/')) {
       return;
     }
 
-    // بررسی وضعیت کاربر
     if (!userState[chatId]) {
       showMainMenu(chatId, 'Please use the buttons to interact.');
       return;
@@ -575,7 +926,6 @@ function mainTelegram() {
 
     const state = userState[chatId];
 
-    // افزودن کیف‌پول
     if (state.step === 'add_wallet_input') {
       try {
         const lines = msg.text.split('\n').map(line => line.trim());
@@ -614,7 +964,7 @@ function mainTelegram() {
             inline_keyboard: [backToHomeButton],
           },
         });
-        delete userState[chatId]; // پایان عملیات
+        delete userState[chatId];
       } catch (err) {
         bot.sendMessage(chatId, `Error adding wallet: ${err.message}`, {
           reply_markup: {
@@ -625,11 +975,86 @@ function mainTelegram() {
       return;
     }
 
-    // وارد کردن تعداد تراکنش‌ها
+    if (state.step === 'enter_threads') {
+      const numThreads = parseInt(msg.text.trim());
+      if (isNaN(numThreads) || numThreads < MIN_THREADS || numThreads > MAX_THREADS) {
+        bot.sendMessage(chatId, `Invalid number. Please enter a number between ${MIN_THREADS} and ${MAX_THREADS}.`, {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'enter_transactions', destination: state.destination, numThreads };
+      bot.sendMessage(chatId, `Enter the number of transactions per wallet [${MIN_TRANSACTIONS}-${MAX_TRANSACTIONS}]:`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      return;
+    }
+
     if (state.step === 'enter_transactions') {
       const maxTransaction = parseInt(msg.text.trim());
-      if (isNaN(maxTransaction) || maxTransaction <= 0) {
-        bot.sendMessage(chatId, 'Invalid number. Please enter a positive number.', {
+      if (isNaN(maxTransaction) || maxTransaction < MIN_TRANSACTIONS || maxTransaction > MAX_TRANSACTIONS) {
+        bot.sendMessage(chatId, `Invalid number. Please enter a number between ${MIN_TRANSACTIONS} and ${MAX_TRANSACTIONS}.`, {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'enter_min_percent', destination: state.destination, numThreads: state.numThreads, maxTransaction };
+      bot.sendMessage(chatId, `Enter the minimum percentage of USDC balance to use [${MIN_PERCENT}-${MAX_PERCENT}]:`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      return;
+    }
+
+    if (state.step === 'enter_min_percent') {
+      const minPercent = parseFloat(msg.text.trim());
+      if (isNaN(minPercent) || minPercent < MIN_PERCENT || minPercent > MAX_PERCENT) {
+        bot.sendMessage(chatId, `Invalid percentage. Please enter a number between ${MIN_PERCENT} and ${MAX_PERCENT}.`, {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'enter_max_percent', destination: state.destination, numThreads: state.numThreads, maxTransaction: state.maxTransaction, minPercent };
+      bot.sendMessage(chatId, `Enter the maximum percentage of USDC balance to use [${minPercent}-${MAX_PERCENT}]:`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      return;
+    }
+
+    if (state.step === 'enter_max_percent') {
+      const maxPercent = parseFloat(msg.text.trim());
+      if (isNaN(maxPercent) || maxPercent < state.minPercent || maxPercent > MAX_PERCENT) {
+        bot.sendMessage(chatId, `Invalid percentage. Please enter a number between ${state.minPercent} and ${MAX_PERCENT}.`, {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'enter_delay', destination: state.destination, numThreads: state.numThreads, maxTransaction: state.maxTransaction, minPercent: state.minPercent, maxPercent };
+      bot.sendMessage(chatId, `Enter delay between transactions (seconds, ${MIN_DELAY}-${MAX_DELAY}):`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      return;
+    }
+
+    if (state.step === 'enter_delay') {
+      const delaySeconds = parseFloat(msg.text.trim());
+      if (isNaN(delaySeconds) || delaySeconds < MIN_DELAY || delaySeconds > MAX_DELAY) {
+        bot.sendMessage(chatId, `Invalid delay. Please enter a number between ${MIN_DELAY} and ${MAX_DELAY} seconds.`, {
           reply_markup: {
             inline_keyboard: [backToHomeButton],
           },
@@ -637,7 +1062,7 @@ function mainTelegram() {
         return;
       }
 
-      const destination = state.destination;
+      const { destination, numThreads, maxTransaction, minPercent, maxPercent } = state;
       const wallets = loadWallets();
       if (wallets.length === 0) {
         bot.sendMessage(chatId, 'No wallets found. Please add wallets first.', {
@@ -649,60 +1074,44 @@ function mainTelegram() {
         return;
       }
 
-      bot.sendMessage(chatId, `Starting ${maxTransaction} transaction(s) to ${destination}...`, {
+      bot.sendMessage(chatId, `Starting ${maxTransaction} transaction(s) to ${destination} with ${numThreads} threads...`, {
         reply_markup: {
           inline_keyboard: [backToHomeButton],
         },
       });
 
-      for (const walletInfo of wallets) {
+      const validWallets = wallets.filter(walletInfo => {
         if (!walletInfo.privatekey) {
-          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Missing privatekey.`, {
-            reply_markup: {
-              inline_keyboard: [backToHomeButton],
-            },
-          });
-          continue;
+          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Missing privatekey.`);
+          return false;
         }
         if (!walletInfo.privatekey.startsWith('0x')) {
-          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Privatekey must start with '0x'.`, {
-            reply_markup: {
-              inline_keyboard: [backToHomeButton],
-            },
-          });
-          continue;
+          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Privatekey must start with '0x'.`);
+          return false;
         }
         if (!/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
-          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Privatekey is not a valid 64-character hexadecimal string.`, {
-            reply_markup: {
-              inline_keyboard: [backToHomeButton],
-            },
-          });
-          continue;
+          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Privatekey is not a valid 64-character hexadecimal string.`);
+          return false;
         }
+        return true;
+      });
 
-        if (destination === 'holesky') {
-          await sendFromWallet(walletInfo, maxTransaction, 'holesky', bot, chatId);
-        } else if (destination === 'babylon') {
-          await sendFromWallet(walletInfo, maxTransaction, 'babylon', bot, chatId);
-        } else if (destination === 'random') {
-          const destinations = ['holesky', 'babylon'].filter(dest => dest !== 'babylon' || walletInfo.babylonAddress);
-          if (destinations.length === 0) {
-            bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': No valid destinations (missing babylonAddress).`, {
-              reply_markup: {
-                inline_keyboard: [backToHomeButton],
-              },
-            });
-            continue;
-          }
-          for (let i = 0; i < maxTransaction; i++) {
-            const randomDest = destinations[Math.floor(Math.random() * destinations.length)];
-            await sendFromWallet(walletInfo, 1, randomDest, bot, chatId);
-            if (i < maxTransaction - 1) {
-              await delay(1000);
-            }
-          }
-        }
+      if (validWallets.length === 0) {
+        bot.sendMessage(chatId, 'No valid wallets to process. Check wallets.json for valid entries.', {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        delete userState[chatId];
+        return;
+      }
+
+      if (destination === 'holesky') {
+        await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'holesky', minPercent, maxPercent, delaySeconds, bot, chatId);
+      } else if (destination === 'babylon') {
+        await processWalletsInThreads(validWallets, numThreads, 'sendFromWallet', maxTransaction, 'babylon', minPercent, maxPercent, delaySeconds, bot, chatId);
+      } else if (destination === 'random') {
+        await processWalletsInThreads(validWallets, numThreads, 'sendFromWalletRandom', maxTransaction, minPercent, maxPercent, delaySeconds, bot, chatId);
       }
 
       bot.sendMessage(chatId, 'Transaction process completed.', {
@@ -710,26 +1119,183 @@ function mainTelegram() {
           inline_keyboard: [backToHomeButton],
         },
       });
-      delete userState[chatId]; // پایان عملیات
+      delete userState[chatId];
+      return;
+    }
+
+    if (state.step === 'enter_faucet_amount') {
+      const amount = parseFloat(msg.text.trim());
+      if (isNaN(amount) || amount <= 0) {
+        bot.sendMessage(chatId, `Invalid ${state.faucetType.toUpperCase()} amount. Please enter a positive number.`, {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+      userState[chatId] = { step: 'enter_faucet_delay', faucetType: state.faucetType, amount, faucetWalletName: state.faucetWalletName };
+      bot.sendMessage(chatId, `Enter delay between transfers (seconds, ${MIN_DELAY}-${MAX_DELAY}):`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      return;
+    }
+
+    if (state.step === 'enter_faucet_delay') {
+      const delaySeconds = parseFloat(msg.text.trim());
+      if (isNaN(delaySeconds) || delaySeconds < MIN_DELAY || delaySeconds > MAX_DELAY) {
+        bot.sendMessage(chatId, `Invalid delay. Please enter a number between ${MIN_DELAY} and ${MAX_DELAY} seconds.`, {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        return;
+      }
+
+      const wallets = loadWallets();
+      if (wallets.length === 0) {
+        bot.sendMessage(chatId, 'No wallets found. Please add wallets first.', {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        delete userState[chatId];
+        return;
+      }
+
+      const validWallets = wallets.filter(walletInfo => {
+        if (!walletInfo.privatekey) {
+          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Missing privatekey.`);
+          return false;
+        }
+        if (!walletInfo.privatekey.startsWith('0x')) {
+          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Privatekey must start with '0x'.`);
+          return false;
+        }
+        if (!/^(0x)[0-9a-fA-F]{64}$/.test(walletInfo.privatekey)) {
+          bot.sendMessage(chatId, `Skipping wallet '${walletInfo.name}': Privatekey is not a valid 64-character hexadecimal string.`);
+          return false;
+        }
+        return true;
+      });
+
+      if (validWallets.length === 0) {
+        bot.sendMessage(chatId, 'No valid wallets to process. Check wallets.json for valid entries.', {
+          reply_markup: {
+            inline_keyboard: [backToHomeButton],
+          },
+        });
+        delete userState[chatId];
+        return;
+      }
+
+      bot.sendMessage(chatId, `Starting ${state.faucetType.toUpperCase()} transfers to ${validWallets.length} wallets using wallet '${state.faucetWalletName}'...`, {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+
+      if (state.faucetType === 'usdc') {
+        await faucetTransferUSDC(state.faucetWalletName, validWallets, state.amount, delaySeconds, true, bot, chatId);
+      } else if (state.faucetType === 'eth') {
+        await faucetTransferETH(state.faucetWalletName, validWallets, state.amount, delaySeconds, true, bot, chatId);
+      }
+
+      bot.sendMessage(chatId, 'Faucet transfer process completed.', {
+        reply_markup: {
+          inline_keyboard: [backToHomeButton],
+        },
+      });
+      delete userState[chatId];
     }
   });
 
   logger.info('Telegram bot started with inline keyboard.');
 }
 
-// تابع اصلی
-async function main() {
-  try {
-    if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
-      mainTelegram();
-    } else {
-      mainConsole();
+async function processWalletsInThreads(wallets, numThreads, processFunction, ...args) {
+  const threadCount = Math.min(numThreads, wallets.length, MAX_THREADS);
+  const walletsPerThread = Math.ceil(wallets.length / threadCount);
+  const tasks = [];
+
+  for (let i = 0; i < threadCount; i++) {
+    const start = i * walletsPerThread;
+    const end = Math.min(start + walletsPerThread, wallets.length);
+    const threadWallets = wallets.slice(start, end);
+    if (threadWallets.length > 0) {
+      tasks.push(runWorker({ wallets: threadWallets, processFunction, args }));
     }
-  } catch (err) {
-    logger.error(`Main error: ${err.message}`);
-    rl.close();
-    process.exit(1);
   }
+
+  await Promise.all(tasks);
 }
 
-main();
+async function runWorker(workerData) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(__filename, { workerData });
+    worker.on('message', resolve);
+    worker.on('error', reject);
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`Worker stopped with exit code ${code}`));
+    });
+  });
+}
+
+if (isMainThread) {
+  async function main() {
+    try {
+      if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
+        mainTelegram();
+      } else {
+        mainConsole();
+      }
+    } catch (err) {
+      logger.error(`Main error: ${err.message}`);
+      rl.close();
+      process.exit(1);
+    }
+  }
+
+  main();
+} else {
+  async function sendFromWalletRandom(walletInfo, maxTransaction, minPercent, maxPercent, delaySeconds, telegramBot = null, chatId = null) {
+    const destinations = ['holesky', 'babylon'].filter(dest => dest !== 'babylon' || walletInfo.babylonAddress);
+    if (destinations.length === 0) {
+      const msg = `Skipping wallet '${walletInfo.name}': No valid destinations (missing babylonAddress).`;
+      logger.warn(msg);
+      if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+      return;
+    }
+    for (let i = 0; i < maxTransaction; i++) {
+      const randomDest = destinations[Math.floor(Math.random() * destinations.length)];
+      await sendFromWallet(walletInfo, 1, randomDest, minPercent, maxPercent, delaySeconds, telegramBot, chatId);
+      if (i < maxTransaction - 1) {
+        const msg = `Waiting ${delaySeconds} seconds before next transaction...`;
+        logger.info(msg);
+        if (telegramBot && chatId) telegramBot.sendMessage(chatId, msg);
+        await delay(delaySeconds * 1000);
+      }
+    }
+  }
+
+  const { wallets, processFunction, args } = workerData;
+  let fn;
+  if (processFunction === 'sendFromWallet') {
+    fn = sendFromWallet;
+  } else if (processFunction === 'sendFromWalletRandom') {
+    fn = sendFromWalletRandom;
+  }
+
+  async function run() {
+    for (const walletInfo of wallets) {
+      await fn(walletInfo, ...args);
+    }
+    parentPort.postMessage('done');
+  }
+
+  run().catch(err => {
+    console.error(`Worker error: ${err.message}`);
+    parentPort.postMessage('error');
+  });
+}
